@@ -1,0 +1,31 @@
+[Unit]
+Description=Raw Byte Meter Kafka payload metering service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=raw-byte-meter
+Group=raw-byte-meter
+WorkingDirectory=/opt/raw-byte-meter
+
+ExecStart=/usr/bin/java -jar /opt/raw-byte-meter/raw-bytes-meter-1.0.0.jar measure --config /opt/raw-byte-meter/config.properties
+
+Restart=always
+RestartSec=15
+
+SuccessExitStatus=143
+TimeoutStopSec=45
+
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/raw-byte-meter
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raw-byte-meter
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+JAR="${RAW_BYTE_METER_JAR:-$ROOT_DIR/target/raw-bytes-meter-1.0.0.jar}"
+
+if [[ ! -f "$JAR" ]]; then
+    echo "Error: jar not found: $JAR" >&2
+    echo "Build it with: mvn package" >&2
+    exit 1
+fi
+
+exec java -jar "$JAR" "$@"
