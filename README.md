@@ -149,6 +149,50 @@ Message key format:
 <window_type>:<window_start>:<topic>
 ```
 
+## Assembler
+
+The meter writes one JSON record per topic per window to `summary.topic`. The `assemble` mode compiles all per-topic summaries for a given window into a single JSON report and writes it to `reports.topic`.
+
+Run it:
+
+```bash
+java -jar raw-bytes-meter-1.0.0.jar assemble --config config.properties
+```
+
+A window is flushed and emitted once no new summary record for it has arrived for `assemble.idle.seconds`. Since the meter writes every topic for a window in one batch, a short idle window (default 5s) is normally enough to catch every topic before emitting.
+
+Example report:
+
+```json
+{
+  "window_type": "interval",
+  "window_start": "2026-06-10T18:00:00Z",
+  "window_end": "2026-06-10T19:00:00Z",
+  "topics": [
+    {
+      "topic": "topicA",
+      "record_count": 1234,
+      "key_bytes": 1200,
+      "value_bytes": 987654,
+      "header_bytes": 3456,
+      "total_bytes": 992310
+    },
+    {
+      "topic": "topicB",
+      "record_count": 5678,
+      "key_bytes": 1000,
+      "value_bytes": 987854,
+      "header_bytes": 3956,
+      "total_bytes": 992810
+    }
+  ]
+}
+```
+
+Message key format: `<window_type>:<window_start>`.
+
+Run `assemble` as a separate, long-running process from `measure`, with its own consumer group (`assembler.application.id`) so it doesn't interfere with the meter's offsets. Create `reports.topic` before starting unless broker auto-create is enabled.
+
 ## systemd Deployment
 
 Recommended layout:

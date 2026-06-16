@@ -11,6 +11,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Properties;
@@ -58,8 +59,213 @@ public class RawBytesMeter {
             case "discover":
                 discoverTopics(config).forEach(System.out::println);
                 break;
+            case "assemble":
+                runAssemble(config);
+                break;
             default:
                 printUsageAndExit();
+        }
+    }
+
+    private static void runAssemble(Properties config) throws Exception {
+        String bootstrapServers = require(config, "bootstrap.servers");
+        String summaryTopic = require(config, "summary.topic");
+        String reportsTopic = require(config, "reports.topic");
+        String appId = config.getProperty("assembler.application.id", "raw-byte-assembler");
+        int idleSeconds = intProp(config, "assemble.idle.seconds", 5);
+        String offsetReset = config.getProperty("auto.offset.reset", "latest");
+
+        Properties consumerProps = kafkaProps(config);
+        consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        consumerProps.put(ConsumerConfig.GROUP_ID_CONFIG, appId);
+        consumerProps.put(ConsumerConfig.KEY_DESERIALIZER_CLASS_CONFIG,
+            ByteArrayDeserializer.class.getName());
+        consumerProps.put(ConsumerConfig.VALUE_DESERIALIZER_CLASS_CONFIG,
+            ByteArrayDeserializer.class.getName());
+        consumerProps.put(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false");
+        consumerProps.put(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, offsetReset);
+
+        Properties producerProps = kafkaProps(config);
+        producerProps.put(ProducerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
+        producerProps.put(ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG,
+            ByteArraySerializer.class.getName());
+        producerProps.put(ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG,
+            ByteArraySerializer.class.getName());
+        producerProps.put(ProducerConfig.ACKS_CONFIG, "all");
+
+        CountDownLatch shutdown = new CountDownLatch(1);
+        Runtime.getRuntime().addShutdownHook(new Thread(shutdown::countDown));
+
+        Map<String, WindowBuffer> buffers = new LinkedHashMap<>();
+
+        System.err.printf("raw-byte-meter assemble starting: group=%s summary.topic=%s reports.topic=%s idle=%ds%n",
+            appId, summaryTopic, reportsTopic, idleSeconds);
+
+        try (
+            KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(consumerProps);
+            KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(producerProps)
+        ) {
+            consumer.subscribe(List.of(summaryTopic));
+
+            while (shutdown.getCount() > 0) {
+                ConsumerRecords<byte[], byte[]> records = consumer.poll(Duration.ofSeconds(1));
+                long nowMs = System.currentTimeMillis();
+
+                for (ConsumerRecord<byte[], byte[]> record : records) {
+                    if (record.value() == null) continue;
+                    String json = new String(record.value(), StandardCharsets.UTF_8);
+                    try {
+                        addToBuffer(buffers, json, nowMs);
+                    } catch (RuntimeException ex) {
+                        System.err.printf("WARN unable to parse summary record at offset=%d: %s%n",
+                            record.offset(), ex.getMessage());
+                    }
+                }
+
+                if (!records.isEmpty()) {
+                    flushIdleWindows(producer, reportsTopic, buffers, nowMs, idleSeconds);
+                    consumer.commitAsync();
+                }
+            }
+
+            System.err.println("shutdown requested; flushing remaining windows");
+            flushIdleWindows(producer, reportsTopic, buffers, Long.MAX_VALUE, 0);
+            producer.flush();
+            consumer.commitSync();
+        }
+    }
+
+    private static void addToBuffer(
+        Map<String, WindowBuffer> buffers,
+        String summaryJson,
+        long nowMs
+    ) {
+        String windowType = jsonValue(summaryJson, "window_type");
+        String windowStart = jsonValue(summaryJson, "window_start");
+        String windowEnd = jsonValue(summaryJson, "window_end");
+        String topic = jsonValue(summaryJson, "topic");
+        long recordCount = Long.parseLong(jsonValue(summaryJson, "record_count"));
+        long keyBytes = Long.parseLong(jsonValue(summaryJson, "key_bytes"));
+        long valueBytes = Long.parseLong(jsonValue(summaryJson, "value_bytes"));
+        long headerBytes = Long.parseLong(jsonValue(summaryJson, "header_bytes"));
+        long totalBytes = Long.parseLong(jsonValue(summaryJson, "total_bytes"));
+
+        String windowKey = windowType + "|" + windowStart + "|" + windowEnd;
+        WindowBuffer buffer = buffers.computeIfAbsent(windowKey,
+            ignored -> new WindowBuffer(windowType, windowStart, windowEnd));
+        buffer.topics.put(topic, new TopicReport(topic, recordCount, keyBytes, valueBytes, headerBytes, totalBytes));
+        buffer.lastUpdateMs = nowMs;
+    }
+
+    private static void flushIdleWindows(
+        KafkaProducer<byte[], byte[]> producer,
+        String reportsTopic,
+        Map<String, WindowBuffer> buffers,
+        long nowMs,
+        int idleSeconds
+    ) {
+        List<String> ready = new ArrayList<>();
+        for (Map.Entry<String, WindowBuffer> entry : buffers.entrySet()) {
+            if (nowMs - entry.getValue().lastUpdateMs >= Duration.ofSeconds(idleSeconds).toMillis()) {
+                ready.add(entry.getKey());
+            }
+        }
+
+        for (String windowKey : ready) {
+            WindowBuffer buffer = buffers.remove(windowKey);
+            String reportJson = reportJson(buffer);
+            byte[] key = (buffer.windowType + ":" + buffer.windowStart).getBytes(StandardCharsets.UTF_8);
+            byte[] value = reportJson.getBytes(StandardCharsets.UTF_8);
+            producer.send(new ProducerRecord<>(reportsTopic, key, value), (metadata, ex) -> {
+                if (ex != null) {
+                    System.err.printf("ERROR produce reports topic=%s window=%s: %s%n",
+                        reportsTopic, buffer.windowStart, ex.getMessage());
+                } else {
+                    System.err.printf("report produced type=%s window=%s topics=%d partition=%d offset=%d%n",
+                        buffer.windowType, buffer.windowStart, buffer.topics.size(),
+                        metadata.partition(), metadata.offset());
+                }
+            });
+        }
+        if (!ready.isEmpty()) producer.flush();
+    }
+
+    private static String reportJson(WindowBuffer buffer) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("{")
+            .append("\"window_type\":\"").append(jsonEscape(buffer.windowType)).append("\",")
+            .append("\"window_start\":\"").append(jsonEscape(buffer.windowStart)).append("\",")
+            .append("\"window_end\":\"").append(jsonEscape(buffer.windowEnd)).append("\",")
+            .append("\"topics\":[");
+
+        boolean first = true;
+        for (TopicReport tr : new TreeMap<>(buffer.topics).values()) {
+            if (!first) sb.append(",");
+            first = false;
+            sb.append("{")
+                .append("\"topic\":\"").append(jsonEscape(tr.topic)).append("\",")
+                .append("\"record_count\":").append(tr.recordCount).append(",")
+                .append("\"key_bytes\":").append(tr.keyBytes).append(",")
+                .append("\"value_bytes\":").append(tr.valueBytes).append(",")
+                .append("\"header_bytes\":").append(tr.headerBytes).append(",")
+                .append("\"total_bytes\":").append(tr.totalBytes)
+                .append("}");
+        }
+        sb.append("]}");
+        return sb.toString();
+    }
+
+    private static String jsonValue(String json, String key) {
+        String quotedPattern = "\"" + key + "\":\"";
+        int idx = json.indexOf(quotedPattern);
+        if (idx >= 0) {
+            int start = idx + quotedPattern.length();
+            int end = json.indexOf('"', start);
+            if (end < 0) throw new IllegalArgumentException("malformed value for key: " + key);
+            return json.substring(start, end);
+        }
+
+        String numericPattern = "\"" + key + "\":";
+        idx = json.indexOf(numericPattern);
+        if (idx < 0) throw new IllegalArgumentException("missing key: " + key);
+        int start = idx + numericPattern.length();
+        int end = start;
+        while (end < json.length() && (Character.isDigit(json.charAt(end)) || json.charAt(end) == '-')) {
+            end++;
+        }
+        if (end == start) throw new IllegalArgumentException("malformed numeric value for key: " + key);
+        return json.substring(start, end);
+    }
+
+    private static final class WindowBuffer {
+        final String windowType;
+        final String windowStart;
+        final String windowEnd;
+        final Map<String, TopicReport> topics = new HashMap<>();
+        long lastUpdateMs;
+
+        WindowBuffer(String windowType, String windowStart, String windowEnd) {
+            this.windowType = windowType;
+            this.windowStart = windowStart;
+            this.windowEnd = windowEnd;
+        }
+    }
+
+    private static final class TopicReport {
+        final String topic;
+        final long recordCount;
+        final long keyBytes;
+        final long valueBytes;
+        final long headerBytes;
+        final long totalBytes;
+
+        TopicReport(String topic, long recordCount, long keyBytes, long valueBytes, long headerBytes, long totalBytes) {
+            this.topic = topic;
+            this.recordCount = recordCount;
+            this.keyBytes = keyBytes;
+            this.valueBytes = valueBytes;
+            this.headerBytes = headerBytes;
+            this.totalBytes = totalBytes;
         }
     }
 
@@ -429,6 +635,7 @@ public class RawBytesMeter {
         System.err.println("Usage:");
         System.err.println("  java -jar raw-byte-meter.jar measure --config config.properties");
         System.err.println("  java -jar raw-byte-meter.jar discover --config config.properties");
+        System.err.println("  java -jar raw-byte-meter.jar assemble --config config.properties");
         System.err.println("  java -jar raw-byte-meter.jar config.properties  # shorthand for measure");
         System.exit(1);
     }
