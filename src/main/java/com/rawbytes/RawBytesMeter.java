@@ -73,7 +73,7 @@ public class RawBytesMeter {
         String reportsTopic = require(config, "reports.topic");
         String appId = config.getProperty("assembler.application.id", "raw-byte-assembler");
         int idleSeconds = intProp(config, "assemble.idle.seconds", 5);
-        String offsetReset = config.getProperty("auto.offset.reset", "latest");
+        String offsetReset = config.getProperty("assembler.auto.offset.reset", "earliest");
 
         Properties consumerProps = kafkaProps(config);
         consumerProps.put(ConsumerConfig.BOOTSTRAP_SERVERS_CONFIG, bootstrapServers);
