@@ -123,9 +123,9 @@ public class RawBytesMeter {
                 }
 
                 if (!records.isEmpty()) {
-                    flushIdleWindows(producer, reportsTopic, buffers, nowMs, idleSeconds);
                     consumer.commitAsync();
                 }
+                flushIdleWindows(producer, reportsTopic, buffers, nowMs, idleSeconds);
             }
 
             System.err.println("shutdown requested; flushing remaining windows");

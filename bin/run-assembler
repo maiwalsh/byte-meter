@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+    echo "Usage: $0 <config.properties> <raw-bytes-meter.jar>" >&2
+    exit 1
+fi
+
+CONFIG="$1"
+JAR="$2"
+
+if [[ ! -f "$JAR" ]]; then
+    echo "Error: JAR not found: $JAR" >&2
+    exit 1
+fi
+
+if [[ ! -f "$CONFIG" ]]; then
+    echo "Error: config file not found: $CONFIG" >&2
+    exit 1
+fi
+
+echo "Starting assembler..." >&2
+exec java -jar "$JAR" assemble --config "$CONFIG"
