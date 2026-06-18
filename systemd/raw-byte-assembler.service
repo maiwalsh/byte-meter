@@ -1,0 +1,26 @@
+[Unit]
+Description=Raw Byte Assembler window report compiler
+After=network-online.target raw-byte-meter.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=raw-byte-meter
+Group=raw-byte-meter
+WorkingDirectory=/opt/raw-byte-meter
+ExecStart=/usr/bin/java -jar /opt/raw-byte-meter/raw-bytes-meter-1.0.0.jar assemble --config /opt/raw-byte-meter/config.properties
+Restart=always
+RestartSec=15
+SuccessExitStatus=143
+TimeoutStopSec=45
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+ReadWritePaths=/opt/raw-byte-meter
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=raw-byte-assembler
+
+[Install]
+WantedBy=multi-user.target
